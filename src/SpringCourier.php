@@ -54,6 +54,7 @@ class SpringCourier
         }
 
         $this->saveLabel($response['Shipment']['LabelImage']);
+        $this->emitLabel($response['Shipment']['LabelImage']);
         echo "Label is created!\n";
     }
 
@@ -65,6 +66,13 @@ class SpringCourier
         }
 
         file_put_contents("$dirPath/output.pdf", base64_decode($labelImage));
+    }
+
+    private function emitLabel(string $labelImage): void
+    {
+        header('Content-Type: application/pdf');
+        header('Content-Disposition: attachment; filename="label.pdf"');
+        echo base64_decode($labelImage);
     }
 
     private function validatePackageData(array $order, array $params): void
@@ -97,7 +105,10 @@ class SpringCourier
             'Command' => self::SERVICES_LIST_COMMAND,
         ]));
 
-        if (empty($response['Services']['List'][$service])) {
+        if (
+            !isset($response['Services']['AllowedServices'])
+            || !in_array($service, $response['Services']['AllowedServices'])
+        ) {
             $this->handleError("Service $service not available");
         }
     }
