@@ -26,11 +26,11 @@ class SpringCourier
     public function newPackage(array $order, array $params): string
     {
         $this->validatePackageData($order, $params);
-        $payload = $this->getPackageData($order, $params);
-        $response = $this->makeRequest(json_encode($payload));
+        $payload = json_encode($this->getPackageData($order, $params));
+        $response = $this->makeRequest($payload);
 
         if (!isset($response['Shipment']['TrackingNumber'])) {
-            $this->handleError(sprintf("Error: %s", $response['Error']));
+            $this->handleError("Error: " . ($response['Error'] ?? 'Unknown error'));
         }
 
         return $response['Shipment']['TrackingNumber'];
@@ -53,141 +53,142 @@ class SpringCourier
             $this->handleError('Błąd pobierania etykiety: ' . ($response['Error'] ?? 'Nieznany błąd'));
         }
 
+        $this->saveLabel($response['Shipment']['LabelImage']);
+        echo "Label is created!\n";
+    }
 
-        if (!is_dir(__DIR__ . '/../public')) {
-            mkdir(__DIR__ . '/../public');
+    private function saveLabel(string $labelImage): void
+    {
+        $dirPath = __DIR__ . '/../public';
+        if (!is_dir($dirPath)) {
+            mkdir($dirPath, 0777, true);
         }
 
-        $pdfData = base64_decode($response['Shipment']['LabelImage']);
-        $filePath = __DIR__ . '/../public/output.pdf';
-        file_put_contents($filePath, $pdfData);
+        file_put_contents("$dirPath/output.pdf", base64_decode($labelImage));
     }
 
     private function validatePackageData(array $order, array $params): void
     {
         $packageData = array_merge($order, $params);
 
-        // Validate mandatory fields
         foreach (ServicesRules::PACKAGE_REQUIRED_PARAMS as $key) {
-            if (!isset($packageData[$key])) $this->handleError("Missing mandatory parameter: $key");
+            if (empty($packageData[$key])) {
+                $this->handleError("Missing mandatory parameter: $key");
+            }
         }
 
+        $this->validatePostalCode($order);
+        $this->validateServiceAvailability($packageData['service']);
+        $this->validateServiceRules($packageData);
+    }
+
+    private function validatePostalCode(array $order): void
+    {
         $postalCodeField = in_array($order['delivery_country'], ["US", "CA", "AU"]) ? 'delivery_state' : 'delivery_postalcode';
-        if (!isset($order[$postalCodeField])) {
+        if (empty($order[$postalCodeField])) {
             $this->handleError("Missing mandatory parameter: $postalCodeField");
         }
+    }
 
-        $service = $packageData['service'];
+    private function validateServiceAvailability(string $service): void
+    {
         $response = $this->makeRequest(json_encode([
             'Apikey' => $this->apiKey,
-            'Command' => static::SERVICES_LIST_COMMAND,
+            'Command' => self::SERVICES_LIST_COMMAND,
         ]));
 
-        // Validate is service is available
-        if (!isset($response['Services']['List'][$service])) {
+        if (empty($response['Services']['List'][$service])) {
             $this->handleError("Service $service not available");
         }
+    }
 
-        // Validate service rules
+    private function validateServiceRules(array $packageData): void
+    {
+        $service = $packageData['service'];
         $serviceRules = ServicesRules::getRules();
+
         if (!isset($serviceRules[$service])) {
             return;
         }
 
         foreach ($serviceRules[$service] as $field => $value) {
             $fieldType = ServicesRules::getFieldType($field);
-            if (!isset($packageData[$field]) || !isset($fieldType)) {
+
+            if (!isset($packageData[$field]) || !$fieldType) {
                 continue;
             }
 
-            if ($fieldType === ServicesRules::RULE_LENGTH) {
-                if (strlen($packageData[$field]) > $value) {
-                    $this->handleError("Field $field is too long");
-                }
-            }
-
-            if ($fieldType === ServicesRules::RULE_COUNTRY_CONTAINS) {
-                if (!str_contains($value, $packageData[$field])) {
-                    $this->handleError("Service is not enabled for this country $packageData[$field]");
-                }
-            }
-
-            if ($fieldType === ServicesRules::RULE_VALUE) {
-                if ($packageData[$field] > $value) {
-                    $this->handleError("Field $field value is too high");
-                }
+            switch ($fieldType) {
+                case ServicesRules::RULE_LENGTH:
+                    if (strlen($packageData[$field]) > $value) {
+                        $this->handleError("Field $field is too long");
+                    }
+                    break;
+                case ServicesRules::RULE_COUNTRY_CONTAINS:
+                    if (!str_contains($value, $packageData[$field])) {
+                        $this->handleError("Service not enabled for country: $packageData[$field]");
+                    }
+                    break;
+                case ServicesRules::RULE_VALUE:
+                    if ($packageData[$field] > $value) {
+                        $this->handleError("Field $field value is too high");
+                    }
+                    break;
             }
         }
     }
 
     private function getPackageData(array $order, array $params): array
     {
-        $data = [
+        return [
             'Apikey' => $this->apiKey,
             'Command' => self::ORDER_SHIPMENT_COMMAND,
-            'Shipment' => [
+            'Shipment' => array_merge([
                 'LabelFormat' => $params['label_format'] ?? 'PDF',
                 'ShipperReference' => uniqid('PACKAGE_', true),
                 'Service' => $params['service'],
                 'Weight' => $params['weight'] ?? '1.0',
-                'ConsignorAddress' => [
-                    'Name' => $order['sender_fullname'],
-                    'Company' => $order['sender_company'],
-                    'AddressLine1' => $order['sender_address'],
-                    'City' => $order['sender_city'],
-                    'Zip' => $order['sender_postalcode'],
-                    'Phone' => $order['sender_phone'],
-                ],
-                'ConsigneeAddress' => [
-                    'Name' => $order['delivery_fullname'],
-                    'Company' => $order['delivery_company'] ?? '',
-                    'AddressLine1' => $order['delivery_address'],
-                    'City' => $order['delivery_city'],
-                    'Vat' => $order['delivery_vat'] ?? '',
-                    'Country' => $order['delivery_country'],
-                    'Phone' => $order['delivery_phone'],
-                    'Email' => $order['delivery_email']
-                ],
-            ]
+                'ConsignorAddress' => $this->formatAddress($order, 'sender'),
+                'ConsigneeAddress' => $this->formatAddress($order, 'delivery')
+            ], $this->getCountrySpecificFields($order))
         ];
-
-        if (in_array($order['delivery_country'], ["US", "CA", "AU"])) {
-            $data['Shipment']['ConsigneeAddress']['State'] = $order['delivery_state'];
-            $data['Shipment']['ConsignorAddress']['State'] = $order['delivery_state'];
-        } else {
-            $data['Shipment']['ConsigneeAddress']['Zip'] = $order['delivery_postalcode'];
-            $data['Shipment']['ConsignorAddress']['Zip'] = $order['delivery_postalcode'];
-        }
-
-        return $data;
     }
 
-    private function makeRequest(?string $payload = null): array
+    private function formatAddress(array $order, string $prefix): array
+    {
+        return [
+            'Name' => $order["{$prefix}_fullname"],
+            'Company' => $order["{$prefix}_company"] ?? '',
+            'AddressLine1' => $order["{$prefix}_address"],
+            'City' => $order["{$prefix}_city"],
+            'Zip' => $order["{$prefix}_postalcode"] ?? '',
+            'Phone' => $order["{$prefix}_phone"],
+            'Email' => $order["{$prefix}_email"] ?? ''
+        ];
+    }
+
+    private function getCountrySpecificFields(array $order): array
+    {
+        return in_array($order['delivery_country'], ["US", "CA", "AU"]) ?
+            ['State' => $order['delivery_state']] :
+            ['Zip' => $order['delivery_postalcode']];
+    }
+
+    private function makeRequest(string $payload): array
     {
         $ch = curl_init($this->apiUrl);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_TIMEOUT => 10,
+        ]);
 
         $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $error = curl_error($ch);
         curl_close($ch);
 
-        if ($httpCode !== 200 || !$response) {
-            $this->handleError('Api Error: ' . ($error ?: 'Wrong API response'));
-        }
-
-        $result = json_decode($response, true) ?? [];
-
-        if (in_array($result['ErrorLevel'], [1, 10])) {
-            var_dump($payload);
-            $this->handleError('Spring error: ' . ($result['Error'] ?: 'Undefined error'));
-        }
-
-        return $result;
+        return json_decode($response, true) ?? [];
     }
 
     private function handleError(string $error): void
